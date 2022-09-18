@@ -274,6 +274,7 @@ fn IO_IRQ_BANK0() {
             lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
 
             // TODO: Try this with ROSC to see if it is fast enough to sleep and wake.
+            // TODO: Can this happen in a loop outside of the actual interrupt handler?
 
             if let Some(pll_sys_enabled) = pll_sys.0.take() {
                 // Switch clock sources away from plls
@@ -310,25 +311,16 @@ fn IO_IRQ_BANK0() {
                     .vsync
                     .set_interrupt_enabled_dormant_wake(Interrupt::EdgeHigh, true); // 0x00080000 - IO_BANK0_DORMANT_WAKE_INTE3_GPIO28_EDGE_HIGH
                 lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
-                unsafe { xosc_enabled.go_dormant() };
+                let dormant_xosc = unsafe { xosc_enabled.dormant() };
                 lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
-                let initialized_xosc = unsafe { xosc_enabled.get_initialized() };
 
-                // if initialized_xosc.is_stable() {
-                //     debug_pin.set_low().unwrap();
-                // }
-
-                // let initialized_xosc =
-                //     unsafe { dormant_xosc.initialize_from_dormant_wake(XOSC_CRYSTAL_FREQ.Hz()) };
-
-                // let disabled_xosc = CrystalOscillator::new(dormant_xosc.free());
-                // let initialized_xosc;
-                // match disabled_xosc.initialize(XOSC_CRYSTAL_FREQ.Hz()) {
-                //     Ok(x) => initialized_xosc = x,
-                //     Err(_) => crate::panic!("Foo"),
-                // };
+                let disabled_xosc = CrystalOscillator::new(dormant_xosc.free());
+                let initialized_xosc;
+                match disabled_xosc.initialize(XOSC_CRYSTAL_FREQ.Hz()) {
+                    Ok(x) => initialized_xosc = x,
+                    Err(_) => crate::panic!("Foo"),
+                };
                 let xosc_stable_token;
-                //debug_pin.set_low().unwrap();
                 loop {
                     let res = initialized_xosc.await_stabilization();
                     if let Ok(res) = res {
