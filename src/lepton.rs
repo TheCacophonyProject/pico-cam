@@ -7,6 +7,7 @@ use cortex_m::{delay::Delay, prelude::_embedded_hal_blocking_i2c_WriteRead};
 use defmt::{info, warn};
 use embedded_hal::digital::v2::OutputPin;
 
+use rp2040_hal::gpio::bank0::{Gpio3, Gpio5};
 use rp_pico::hal::gpio::bank0::{Gpio10, Gpio11, Gpio28, Gpio8, Gpio9};
 use rp_pico::hal::gpio::{FloatingInput, FunctionSpi, Interrupt, Output, PushPull};
 use rp_pico::hal::spi::Enabled;
@@ -146,7 +147,7 @@ enum LeptonError {
 pub type LeptonCCI_I2C =
     I2CInterface<I2C0, (Pin<Gpio12, Function<I2C>>, Pin<Gpio13, Function<I2C>>)>;
 
-type VsyncPin = Pin<Gpio28, FloatingInput>;
+type VsyncPin = Pin<Gpio3, FloatingInput>;
 pub struct LeptonCCI {
     i2c: LeptonCCI_I2C,
 }
@@ -517,10 +518,8 @@ impl Lepton {
                 true,
             ),
         );
-        // if wait {
         info!("Waiting 5 seconds");
         delay.delay_ms(5000);
-        //}
         self.init(delay);
         ok
     }
@@ -534,7 +533,7 @@ impl Lepton {
                 LeptonCommandType::Set,
                 true,
             ),
-            -3,
+            0,
         );
 
         // Set the phase to -1 line, and see if we have less reboots

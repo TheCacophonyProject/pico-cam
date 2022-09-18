@@ -25,8 +25,9 @@ numtoa = "0.2.4"
 critical-section = "1.1.0"
 fugit = "0.3.6"
 
+rp2040-hal = { path = "../rp-hal/rp2040-hal" }
 # We're using a Pico by default on this template
-rp-pico = "0.5"
+rp-pico = { path = "../rp-hal/boards/rp-pico" }
 
 miniz_oxide = { path = "../miniz_oxide/miniz_oxide", default-features = false }
 
