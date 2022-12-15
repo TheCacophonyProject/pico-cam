@@ -4,10 +4,14 @@ use byte_slice_cast::AsByteSlice;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 use cortex_m::prelude::{_embedded_hal_blocking_i2c_Write, _embedded_hal_blocking_spi_Transfer};
 use cortex_m::{delay::Delay, prelude::_embedded_hal_blocking_i2c_WriteRead};
+use cortex_m::asm::nop;
 use defmt::{info, warn};
-use embedded_hal::digital::v2::OutputPin;
+use embedded_hal::digital::v2::{OutputPin, ToggleableOutputPin};
+use fugit::{HertzU32, RateExtU32};
 
 use rp2040_hal::gpio::bank0::{Gpio3, Gpio5};
+use rp2040_hal::{pac, Sio, Timer};
+use rp2040_hal::gpio::Pins;
 use rp_pico::hal::gpio::bank0::{Gpio10, Gpio11, Gpio28, Gpio8, Gpio9};
 use rp_pico::hal::gpio::{FloatingInput, FunctionSpi, Interrupt, Output, PushPull};
 use rp_pico::hal::spi::Enabled;
@@ -20,6 +24,8 @@ use rp_pico::{
     },
     pac::I2C0,
 };
+
+use crate::{Frame, MicroSecondsInstant, VoSpiState, SEGMENT_LENGTH};
 
 pub enum LeptonCommandType {
     Get = 0b0000_0000_0000_00_00,
@@ -83,6 +89,9 @@ const LEPTON_OEM_BAD_PIXEL_REPLACEMENT: LeptonCommand = (0x006C, 2);
 const LEPTON_OEM_TEMPORAL_FILTER: LeptonCommand = (0x0070, 2);
 const LEPTON_OEM_COLUMN_NOISE_FILTER: LeptonCommand = (0x0074, 2);
 const LEPTON_OEM_PIXEL_NOISE_FILTER: LeptonCommand = (0x0078, 2);
+const LEP_OEM_VIDEO_OUTPUT_SOURCE: LeptonCommand = (0x002c, 2);
+const LEPTON_OEM_POWER_DOWN: LeptonCommand = (0x0000, 0);
+const LEPTON_OEM_VIDEO_OUTPUT_ENABLE: LeptonCommand = (0x0024, 2);
 
 // Should be able to just read into these automatically.
 const LEPTON_DATA_1_REGISTER: LeptonRegister = lepton_register_val(0x000A);
@@ -165,6 +174,7 @@ pub struct Lepton {
     pub spi: LeptonSpi,
     cci: LeptonCCI,
     resetting: bool,
+    clock_running: bool
 }
 
 impl Lepton {
@@ -188,6 +198,7 @@ impl Lepton {
             },
             cci: LeptonCCI { i2c },
             resetting: false,
+            clock_running: true
         }
     }
 
@@ -206,36 +217,35 @@ impl Lepton {
         */
 
         self.reset(delay);
-        self.ping(delay);
+        self.ping();
 
-        self.enable_vsync(delay);
-        self.enable_focus_metric(delay);
-        self.enable_telemetry(delay);
-        self.setup_spot_meter_roi(delay);
-        self.disable_post_processing(delay);
-        self.disable_t_linear(delay);
+        self.enable_vsync();
+        self.enable_focus_metric();
+        self.enable_telemetry();
+        self.setup_spot_meter_roi();
+        self.disable_post_processing();
+        //self.disable_t_linear();
 
         self.spi
             .vsync
             .set_interrupt_enabled(Interrupt::EdgeHigh, true);
 
         info!("=== Init lepton module ===");
-        info!("Got ping? {}", self.ping(delay));
-        info!("AGC enabled? {}", self.acg_enabled(delay));
-        info!("Focus metric enabled? {}", self.focus_metric_enabled(delay));
-        info!("Vsync enabled? {}", self.vsync_enabled(delay));
-        info!("Telemetry enabled? {}", self.telemetry_enabled(delay));
+        info!("Got ping? {}", self.ping());
+        info!("AGC enabled? {}", self.acg_enabled());
+        info!("Focus metric enabled? {}", self.focus_metric_enabled());
+        info!("Vsync enabled? {}", self.vsync_enabled());
+        info!("Telemetry enabled? {}", self.telemetry_enabled());
         info!(
             "Telemetry in footer? {}",
-            self.telemetry_location(delay) == TelemetryLocation::Footer
+            self.telemetry_location() == TelemetryLocation::Footer
         );
-        info!("Output format RAW14? {}", self.output_raw14(delay));
+        info!("Output format RAW14? {}", self.output_raw14());
     }
 
-    fn setup_spot_meter_roi(&mut self, delay: &mut Delay) {
+    fn setup_spot_meter_roi(&mut self) {
         // Change spot meter ROI so we can get scene stats per frame
         self.set_attribute(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_RAD,
                 LEPTON_RAD_SPOT_METER_ROI,
@@ -248,9 +258,8 @@ impl Lepton {
         );
     }
 
-    fn disable_post_processing(&mut self, delay: &mut Delay) {
+    fn disable_post_processing(&mut self) {
         self.set_attribute_i32(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_OEM,
                 LEPTON_OEM_BAD_PIXEL_REPLACEMENT,
@@ -261,7 +270,6 @@ impl Lepton {
         );
 
         self.set_attribute_i32(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_OEM,
                 LEPTON_OEM_TEMPORAL_FILTER,
@@ -272,7 +280,6 @@ impl Lepton {
         );
 
         self.set_attribute_i32(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_OEM,
                 LEPTON_OEM_COLUMN_NOISE_FILTER,
@@ -283,7 +290,6 @@ impl Lepton {
         );
 
         self.set_attribute_i32(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_OEM,
                 LEPTON_OEM_PIXEL_NOISE_FILTER,
@@ -292,11 +298,74 @@ impl Lepton {
             ),
             1,
         );
+
+        // self.set_attribute_i32(
+        //     lepton_command(
+        //         LEPTON_SUB_SYSTEM_OEM,
+        //         LEP_OEM_VIDEO_OUTPUT_SOURCE,
+        //         LeptonCommandType::Set,
+        //         true,
+        //     ),
+        //     3, // Output raw, without post-processing
+        // );
     }
 
-    fn disable_t_linear(&mut self, delay: &mut Delay) {
+    pub fn enable_video_output(&mut self, enabled: bool) {
         self.set_attribute_i32(
-            delay,
+            lepton_command(
+                LEPTON_SUB_SYSTEM_OEM,
+                LEPTON_OEM_VIDEO_OUTPUT_ENABLE,
+                LeptonCommandType::Set,
+                true,
+            ),
+            if enabled { 1 } else { 0 },
+        );
+    }
+
+    pub fn power_down(&mut self) {
+        self.execute_command(
+            lepton_command(
+                LEPTON_SUB_SYSTEM_OEM,
+                LEPTON_OEM_POWER_DOWN,
+                LeptonCommandType::Run,
+                true,
+            ),
+        );
+    }
+
+    pub fn power_on(&mut self) {
+        // Set SDA low
+        let mut peripherals = unsafe { pac::Peripherals::steal() };
+        let sio = Sio::new(peripherals.SIO);
+        let pins = Pins::new(
+            peripherals.IO_BANK0,
+            peripherals.PADS_BANK0,
+            sio.gpio_bank0,
+            &mut peripherals.RESETS,
+        );
+        pins.gpio12.into_push_pull_output().set_low().unwrap();
+        //  Issue a single clock pulse.
+        let mut scl = pins.gpio13.into_push_pull_output();
+        scl.toggle().unwrap();
+        for _ in 0..332 {
+            nop();
+        }
+        scl.toggle().unwrap();
+
+        let _ = self.cci.i2c.write(
+            LEPTON_ADDRESS,
+            &[
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        //self.wait_for_ready(true);
+    }
+
+    fn disable_t_linear(&mut self) {
+        self.set_attribute_i32(
             lepton_command(
                 LEPTON_SUB_SYSTEM_RAD,
                 LEPTON_RAD_TLINEAR_ENABLE_STATE,
@@ -308,7 +377,7 @@ impl Lepton {
     }
 
     pub fn reset(&mut self, delay: &mut Delay) {
-        info!("Resetting pins");
+        info!("Resetting");
         self.resetting = true;
         self.spi.cs.set_low().unwrap();
         self.spi.sck.set_high().unwrap(); // SCK is high when idle
@@ -316,7 +385,7 @@ impl Lepton {
         self.spi.cs.set_high().unwrap();
         self.spi.sck.set_low().unwrap();
         self.resetting = false;
-        info!("Finished resetting pins");
+        //info!("Finished resetting pins");
     }
 
     pub fn is_resetting(&self) -> bool {
@@ -330,7 +399,11 @@ impl Lepton {
         result
     }
 
-    fn wait_for_ffc_status_ready(&mut self, delay: &mut Delay) -> bool {
+    pub fn transfer_block<'w>(&mut self, words: &'w mut [u16]) -> Result<&'w [u16], Infallible> {
+        self.spi.spi.transfer(words)
+    }
+
+    fn wait_for_ffc_status_ready(&mut self) -> bool {
         // loop {
         //     let (ffc_state, length) = self.get_attribute(
         //         delay,
@@ -351,9 +424,8 @@ impl Lepton {
         true
     }
 
-    pub fn telemetry_location(&mut self, delay: &mut Delay) -> TelemetryLocation {
+    pub fn telemetry_location(&mut self) -> TelemetryLocation {
         let (telemetry_location, length) = self.get_attribute(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_SYS,
                 LEPTON_SYS_STATS,
@@ -371,10 +443,9 @@ impl Lepton {
         }
     }
 
-    pub fn enable_telemetry(&mut self, delay: &mut Delay) {
+    pub fn enable_telemetry(&mut self) {
         // Enable telemetry
         self.set_attribute_i32(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_SYS,
                 LEPTON_SYS_TELEMETRY_ENABLE_STATE,
@@ -385,7 +456,6 @@ impl Lepton {
         );
         // Set location to footer
         self.set_attribute_i32(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_SYS,
                 LEPTON_SYS_TELEMETRY_LOCATION,
@@ -396,9 +466,8 @@ impl Lepton {
         );
     }
 
-    pub fn telemetry_enabled(&mut self, delay: &mut Delay) -> bool {
+    pub fn telemetry_enabled(&mut self) -> bool {
         let (telemetry_enabled, length) = self.get_attribute(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_SYS,
                 LEPTON_SYS_TELEMETRY_LOCATION,
@@ -410,9 +479,8 @@ impl Lepton {
         LittleEndian::read_u32(&telemetry_enabled[..((length * 2) as usize)]) == 1
     }
 
-    pub fn output_raw14(&mut self, delay: &mut Delay) -> bool {
+    pub fn output_raw14(&mut self) -> bool {
         let (output_state, length) = self.get_attribute(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_VID,
                 LEPTON_VID_OUTPUT_FORMAT,
@@ -425,9 +493,30 @@ impl Lepton {
         output_state == 7
     }
 
-    pub fn status(&mut self, delay: &mut Delay) -> u32 {
+    pub fn stop_clock(&mut self) {
+        if self.clock_running {
+            self.clock_running = false;
+            self.spi.spi.set_baudrate(0.Hz(), 0.Hz());
+        }
+    }
+
+    pub fn start_clock(&mut self, peri_freq: HertzU32, baudrate: HertzU32) {
+        if !self.clock_running {
+            self.clock_running = true;
+            self.spi.spi.set_baudrate(peri_freq, baudrate);
+        }
+    }
+
+    pub fn cs_low(&mut self) {
+        self.spi.cs.set_low().unwrap();
+    }
+
+    pub fn cs_high(&mut self) {
+        self.spi.cs.set_high().unwrap();
+    }
+
+    pub fn status(&mut self) -> u32 {
         let (output_state, _length) = self.get_attribute(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_SYS,
                 LEPTON_SYS_STATUS,
@@ -439,9 +528,8 @@ impl Lepton {
         LittleEndian::read_u32(&output_state[..4usize])
     }
 
-    pub fn enable_focus_metric(&mut self, delay: &mut Delay) {
+    pub fn enable_focus_metric(&mut self) {
         self.set_attribute_i32(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_VID,
                 LEPTON_VID_FOCUS_ENABLE_STATE,
@@ -452,9 +540,8 @@ impl Lepton {
         );
     }
 
-    pub fn focus_metric_enabled(&mut self, delay: &mut Delay) -> bool {
+    pub fn focus_metric_enabled(&mut self) -> bool {
         let (enabled_focus_state, l) = self.get_attribute(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_VID,
                 LEPTON_VID_FOCUS_ENABLE_STATE,
@@ -466,9 +553,8 @@ impl Lepton {
         LittleEndian::read_u32(&enabled_focus_state[..((l * 2) as usize)]) == 1
     }
 
-    pub fn get_focus_metric(&mut self, delay: &mut Delay) -> u32 {
+    pub fn get_focus_metric(&mut self) -> u32 {
         let (focus_metric, l) = self.get_attribute(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_VID,
                 LEPTON_VID_FOCUS_METRIC,
@@ -480,9 +566,8 @@ impl Lepton {
         LittleEndian::read_u32(&focus_metric[..((l * 2) as usize)])
     }
 
-    pub fn acg_enabled(&mut self, delay: &mut Delay) -> bool {
+    pub fn acg_enabled(&mut self) -> bool {
         let (agc_state, length) = self.get_attribute(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_AGC,
                 LEPTON_AGC_ENABLE_STATE,
@@ -495,9 +580,8 @@ impl Lepton {
         acg_enabled_state == 1
     }
 
-    pub fn ping(&mut self, delay: &mut Delay) -> bool {
+    pub fn ping(&mut self) -> bool {
         self.execute_command(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_SYS,
                 LEPTON_SYS_PING_CAMERA,
@@ -510,7 +594,6 @@ impl Lepton {
     pub fn reboot(&mut self, delay: &mut Delay, wait: bool) -> bool {
         warn!("Rebooting lepton module");
         let ok = self.execute_command(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_OEM,
                 LEPTON_OEM_REBOOT,
@@ -524,21 +607,19 @@ impl Lepton {
         ok
     }
 
-    pub fn enable_vsync(&mut self, delay: &mut Delay) {
+    pub fn enable_vsync(&mut self) {
         self.set_attribute_i32(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_OEM,
                 LEPTON_OEM_GPIO_VSYNC_PHASE_DELAY,
                 LeptonCommandType::Set,
                 true,
             ),
-            0,
+            3,
         );
 
         // Set the phase to -1 line, and see if we have less reboots
         self.set_attribute_i32(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_OEM,
                 LEPTON_OEM_GPIO_MODE,
@@ -549,9 +630,8 @@ impl Lepton {
         );
     }
 
-    pub fn vsync_enabled(&mut self, delay: &mut Delay) -> bool {
+    pub fn vsync_enabled(&mut self) -> bool {
         let (vsync_state, length) = self.get_attribute(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_OEM,
                 LEPTON_OEM_GPIO_MODE,
@@ -563,9 +643,8 @@ impl Lepton {
         LittleEndian::read_u32(&vsync_state[..((length * 2) as usize)]) == 5
     }
 
-    pub fn scene_stats(&mut self, delay: &mut Delay) -> SceneStats {
+    pub fn scene_stats(&mut self) -> SceneStats {
         let (scene_stats, _length) = self.get_attribute(
-            delay,
             lepton_command(
                 LEPTON_SUB_SYSTEM_SYS,
                 LEPTON_SYS_STATS,
@@ -582,7 +661,7 @@ impl Lepton {
         }
     }
 
-    pub fn wait_for_ready(&mut self, delay: &mut Delay) -> u16 {
+    pub fn wait_for_ready(&mut self, print: bool) -> u16 {
         let mut readbuf: [u8; 2];
         let mut camera_status = 0u16;
         loop {
@@ -593,7 +672,9 @@ impl Lepton {
                 .write_read(LEPTON_ADDRESS, &LEPTON_STATUS_REGISTER, &mut readbuf)
                 .map_or(false, |_| {
                     camera_status = BigEndian::read_u16(&readbuf);
-                    //info!("Camera status {:#018b}", camera_status);
+                    if print {
+                        info!("Camera status {:#018b}", camera_status);
+                    }
                     camera_status & (LEPTON_BOOTED | LEPTON_BOOT_MODE | LEPTON_BUSY) != 0
                 })
             {
@@ -605,11 +686,10 @@ impl Lepton {
 
     fn execute_command(
         &mut self,
-        delay: &mut Delay,
         (command, _length): LeptonSynthesizedCommand,
     ) -> bool {
-        self.wait_for_ready(delay);
-        self.wait_for_ffc_status_ready(delay);
+        self.wait_for_ready(false);
+        self.wait_for_ffc_status_ready();
         let result = self.cci.i2c.write(
             LEPTON_ADDRESS,
             &[
@@ -620,22 +700,22 @@ impl Lepton {
                 // TODO
             ],
         );
-        self.wait_for_ready(delay);
+        self.wait_for_ready(false);
 
         // TODO Process errors
         // Now read the status register to see if it worked?
         result.is_ok()
     }
 
+
     fn get_attribute(
         &mut self,
-        delay: &mut Delay,
         (command, length): LeptonSynthesizedCommand,
         wait_for_ffc: bool,
     ) -> ([u8; 32], u16) {
-        self.wait_for_ready(delay);
+        self.wait_for_ready(false);
         if wait_for_ffc {
-            self.wait_for_ffc_status_ready(delay);
+            self.wait_for_ffc_status_ready();
         }
         let len = lepton_register_val(length);
         let _ = self.cci.i2c.write(
@@ -658,7 +738,7 @@ impl Lepton {
             ],
         );
 
-        self.wait_for_ready(delay);
+        self.wait_for_ready(false);
 
         // Read command error?
 
@@ -683,12 +763,10 @@ impl Lepton {
 
     fn set_attribute_i32(
         &mut self,
-        delay: &mut Delay,
         command: LeptonSynthesizedCommand,
         val: i32,
     ) -> bool {
         self.set_attribute(
-            delay,
             command,
             &[(val & 0xffff) as u16, (val >> 16 & 0xffff) as u16],
         )
@@ -696,12 +774,11 @@ impl Lepton {
 
     fn set_attribute(
         &mut self,
-        delay: &mut Delay,
         (command, length): LeptonSynthesizedCommand,
         words: &[u16],
     ) -> bool {
-        self.wait_for_ready(delay);
-        self.wait_for_ffc_status_ready(delay);
+        self.wait_for_ready(false);
+        self.wait_for_ffc_status_ready();
         let len = lepton_register_val(length);
 
         let _ = self.cci.i2c.write(
@@ -735,7 +812,7 @@ impl Lepton {
             ],
         );
 
-        let success = self.wait_for_ready(delay);
+        let success = self.wait_for_ready(false);
         if (success >> 8) as i8 != 0 {
             warn!("Set attribute error {}", (success >> 8) as i8);
         }
@@ -743,6 +820,150 @@ impl Lepton {
 
         // Now read the status register to see if it worked?
         return success == 0;
+    }
+
+    pub fn get_frame_sync(
+        &mut self,
+        vo_spi_state: &mut VoSpiState,
+        delay: &mut Delay,
+        timer: &Timer,
+        start: MicroSecondsInstant,
+        completed_frame: &mut bool,
+    ) {
+        let mut discards_before_first_good = 0;
+        let mut print_first_packet = true;
+        //let mut vo_spi_state = VoSpiState::new();
+        loop {
+            // This is one scanline
+            let mut buffer = [0u16; 82];
+            let packet = self.transfer(&mut buffer).unwrap();
+
+            let packet_header = packet[0];
+            let is_discard_packet = packet_header & 0x0f00 == 0x0f00;
+            if is_discard_packet {
+                discards_before_first_good += 1;
+                continue;
+            }
+            let packet_id = (packet_header & 0x0fff) as isize;
+            let segment_num = packet_header >> 12;
+            // if segment_num == 0 && packet_id > 20 {
+            //     continue;
+            // }
+            // if print_first_packet {
+            //     info!("First packet #{} in segment {}", packet_id, segment_num);
+            //     print_first_packet = false;
+            // }
+
+            if packet_id == 0 {
+                vo_spi_state.prev_packet_id = -1;
+                vo_spi_state.started_segment = true;
+            } else if packet_id == 20 {
+                // Packet 20 is the only one that contains a meaningful segment number
+                let segment_num = packet_header >> 12;
+
+                // See if we're starting a frame, or ending it.
+                if vo_spi_state.current_segment_num > 0
+                    && vo_spi_state.current_segment_num < 4
+                    && segment_num != vo_spi_state.current_segment_num
+                {
+                    // Segment order mismatch.
+                    warn!(
+                        "Segment order mismatch error: stored {}, this {}",
+                        vo_spi_state.current_segment_num, segment_num
+                    );
+                    vo_spi_state.reset();
+                    // Reset and resync
+                    self.wait_for_ready(false);
+                    self.reset(delay);
+
+                    let end = MicroSecondsInstant::from_ticks(timer.get_counter_low());
+                    let elapsed = end.checked_duration_since(start).unwrap().ticks();
+                }
+                vo_spi_state.current_segment_num = segment_num;
+                if vo_spi_state.current_segment_num == 0 {
+                    vo_spi_state.started_segment = false;
+                }
+            }
+
+            // We only mark a segment as started if the packet num was 0 or 20.
+            if vo_spi_state.started_segment {
+                if packet_id != vo_spi_state.prev_packet_id + 1 {
+                    // Packet order mismatch
+                    warn!(
+                        "Packet order mismatch current: {}, prev: {}, seg {}",
+                        packet_id, vo_spi_state.prev_packet_id, vo_spi_state.current_segment_num
+                    );
+                    vo_spi_state.reset();
+
+                    if vo_spi_state.packet_id_mismatches > 3 {
+                        vo_spi_state.packet_id_mismatches = 0;
+                        let now = MicroSecondsInstant::from_ticks(timer.get_counter_low());
+                        let last = MicroSecondsInstant::from_ticks(vo_spi_state.last_reboot_time);
+                        let elapsed = now.checked_duration_since(last).unwrap().ticks();
+                        warn!(
+                            "{} prior reboots, last was {} mins ago",
+                            vo_spi_state.reboots,
+                            elapsed / 1000 / 1000 / 60,
+                        );
+                        vo_spi_state.reboots += 1;
+                        vo_spi_state.last_reboot_time = timer.get_counter_low();
+                        self.reboot(delay, false);
+                    }
+                    // Reset and resync - do we need to disable vsync in here so we don't keep entering this function?
+                    self.reset(delay);
+                    vo_spi_state.packet_id_mismatches += 1;
+
+                    let end = MicroSecondsInstant::from_ticks(timer.get_counter_low());
+                    let elapsed = end.checked_duration_since(start).unwrap().ticks();
+                }
+                let is_last_segment = vo_spi_state.current_segment_num == 4;
+                if packet_id < 61 && !is_last_segment || packet_id < 57 && is_last_segment {
+                    // Write packet out to frame buffer
+                    let packet_id = packet_id as usize;
+
+                    let segment_offset = (u16::max(vo_spi_state.current_segment_num, 1) - 1)
+                        as usize
+                        * SEGMENT_LENGTH;
+                    let side = packet_id % 2; // + (*current_segment_num - 1) as usize % 2) % 2;
+                    let y = (packet_id - side) >> 1;
+                    let offset = segment_offset + (y * 160) + (80 * side);
+                }
+
+                let segment_ended = packet_id == 60;
+                if segment_ended {}
+
+                if packet_id == 60 && !is_last_segment {
+                    // Increment in good faith if we're on the last packet of a valid segment
+                    vo_spi_state.current_segment_num += 1;
+
+                    let end = MicroSecondsInstant::from_ticks(timer.get_counter_low());
+                    let elapsed = end.checked_duration_since(start).unwrap().ticks();
+                    //break;
+                }
+                if packet_id == 60 && segment_num == 0 {
+                    // This is an invalid frame segment, so we should return until the next vsync
+                    break;
+                }
+                if packet_id == 57 && is_last_segment {
+                    // frame counter
+                    let frame_counter =
+                        LittleEndian::read_u32(&packet[2..][20..=21].as_byte_slice());
+
+                    // Grab two more telemetry rows, and discard
+                    self.transfer(&mut buffer).unwrap(); // packet 58
+                    self.transfer(&mut buffer).unwrap(); // packet 59
+                    let end = MicroSecondsInstant::from_ticks(timer.get_counter_low());
+                    let elapsed = end.checked_duration_since(start).unwrap().ticks();
+                    // Pass control of frame to other core for further processing.
+                    info!("Read out full frame {}", frame_counter);
+                    vo_spi_state.current_frame_num = frame_counter;
+                    *completed_frame = true;
+                    vo_spi_state.reset();
+                    break;
+                }
+            }
+            vo_spi_state.prev_packet_id = packet_id;
+        }
     }
 }
 // TODO - CRC?

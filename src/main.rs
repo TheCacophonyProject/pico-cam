@@ -1,18 +1,15 @@
-//! Blin&ks the LED on a Pico board
-//!
-//! This will blink an LED attached to GP25, which is the pin the Pico uses for the on-board LED.
 #![no_std]
 #![no_main]
 
 mod draw_debug_output;
 mod lepton;
 mod static_string;
+mod utils;
 use bsp::{
     entry,
     hal::{
         clocks::{
-            init_clocks_and_plls, Clock, ClockSource, ClocksManager, InitError, StoppableClock,
-            ValidSrc,
+            Clock, ClockSource, ClocksManager, StoppableClock,
         },
         gpio::{
             bank0::{Gpio17, Gpio18, Gpio20, Gpio22, Gpio26, Gpio27},
@@ -36,18 +33,15 @@ use bsp::{
     pac::{
         clocks::sleep_en0,
         io_bank0::{dormant_wake_inte::DORMANT_WAKE_INTE_SPEC, DORMANT_WAKE_INTE},
-        Peripherals, PLL_SYS, PLL_USB, SPI0,
+        Peripherals, CLOCKS, PLL_SYS, PLL_USB, SPI0,
     },
     XOSC_CRYSTAL_FREQ,
 };
-use byte_slice_cast::AsByteSlice;
-use byteorder::{ByteOrder, LittleEndian};
+
 use lepton::Lepton;
-use miniz_oxide::deflate::{core::TDEFLFlush, CompressionLevel};
-use numtoa::NumToA;
 use rp_pico as bsp;
 
-use cortex_m::{delay::Delay, peripheral::scb};
+use cortex_m::{delay::Delay};
 use defmt::*;
 use defmt_rtt as _;
 
@@ -56,40 +50,26 @@ use ili9341::{DisplaySize240x320, Ili9341, Orientation};
 
 use panic_probe as _;
 
-use display_interface_spi::SPIInterface;
-use embedded_graphics::{
-    mono_font::{ascii::FONT_6X10, MonoTextStyle},
-    pixelcolor::Rgb565,
-    prelude::*,
-    primitives::Rectangle,
-    text::{Alignment, Text},
-};
-
 // Provide an alias for our BSP so we can switch targets quickly.
 // Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
 
 // use sparkfun_pro_micro_rp2040 as bsp;
-use fugit::{HertzU32, Instant, MicrosDurationU32, MillisDurationU32, RateExtU32};
+use fugit::{HertzU32, Instant, RateExtU32};
 
 // Some traits we need
 use embedded_hal::{
-    can::nb,
-    digital::v2::{OutputPin, ToggleableOutputPin},
+    digital::v2::{OutputPin},
 };
-use static_string::StaticString;
 
 use core::{
-    cell::{RefCell, UnsafeCell},
-    fmt::Error,
+    cell::{RefCell},
     time::Duration,
 };
 use critical_section::Mutex;
 
-use crate::lepton::TelemetryLocation;
-
 static mut CORE1_STACK: Stack<4096> = Stack::new();
 
-const SEGMENT_LENGTH: usize = (160 * 122) / 4;
+pub const SEGMENT_LENGTH: usize = (160 * 122) / 4;
 
 struct ClockA;
 
@@ -177,36 +157,7 @@ impl TripleBuffer {
     }
 }
 
-type InterruptState = Option<(
-    Lepton,
-    LedPin,
-    Delay,
-    SioFifo,
-    VoSpiState,
-    Timer,
-    Pin<Gpio27, Output<PushPull>>,
-    ClocksManager,
-    (
-        Option<CrystalOscillator<Stable>>,
-        Option<CrystalOscillator<Dormant>>,
-    ),
-    (
-        Option<RingOscillator<Enabled>>,
-        Option<RingOscillator<rosc::Dormant>>,
-    ),
-    (
-        Option<PhaseLockedLoop<Locked, PLL_SYS>>,
-        Option<PhaseLockedLoop<Disabled, PLL_SYS>>,
-    ),
-    (
-        Option<PhaseLockedLoop<Locked, PLL_USB>>,
-        Option<PhaseLockedLoop<Disabled, PLL_USB>>,
-    ),
-    Watchdog,
-)>;
-
 type LedPin = Pin<Gpio25, PushPullOutput>;
-static GLOBAL_LEPTON_STATE: Mutex<RefCell<InterruptState>> = Mutex::new(RefCell::new(None));
 
 static FRAME_BUFFER: TripleBuffer = TripleBuffer {
     frame_0: Mutex::new(RefCell::new(Frame::new())),
@@ -221,6 +172,7 @@ struct VoSpiState {
     packet_id_mismatches: u8,
     reboots: u32,
     last_reboot_time: u32,
+    current_frame_num: u32,
 }
 
 impl VoSpiState {
@@ -232,6 +184,7 @@ impl VoSpiState {
             packet_id_mismatches: 0,
             reboots: 0,
             last_reboot_time: 0,
+            current_frame_num: 0,
         }
     }
 
@@ -244,551 +197,61 @@ impl VoSpiState {
 
 type MicroSecondsInstant = Instant<u32, 1, 1_000_000>;
 
-#[interrupt]
-fn IO_IRQ_BANK0() {
-    static mut LOCAL_LEPTON_STATE: InterruptState = None;
-
-    if LOCAL_LEPTON_STATE.is_none() {
-        critical_section::with(|cs| {
-            *LOCAL_LEPTON_STATE = GLOBAL_LEPTON_STATE.borrow(cs).take();
-        });
-    }
-
-    if let Some((
-        lepton,
-        led_pin,
-        delay,
-        sio,
-        vo_spi_state,
-        timer,
-        debug_pin,
-        clocks,
-        xosc,
-        rosc,
-        pll_sys,
-        pll_usb,
-        watchdog,
-    )) = LOCAL_LEPTON_STATE
-    {
-        if lepton.spi.vsync.interrupt_status(Interrupt::EdgeHigh) {
-            lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
-
-            // TODO: Try this with ROSC to see if it is fast enough to sleep and wake.
-            // TODO: Can this happen in a loop outside of the actual interrupt handler?
-
-            if let Some(pll_sys_enabled) = pll_sys.0.take() {
-                // Switch clock sources away from plls
-                debug_pin.set_high().unwrap();
-                clocks.peripheral_clock.disable();
-
-                while clocks.system_clock.reset_source_await().is_err() {}
-                while clocks.reference_clock.reset_source_await().is_err() {}
-
-                let pll_sys_disabled = pll_sys_enabled.free();
-                pll_sys_disabled.pwr.reset();
-                //pll_sys_disabled.fbdiv_int.reset();
-
-                let pll_disabled = match PhaseLockedLoop::new(
-                    pll_sys_disabled,
-                    XOSC_CRYSTAL_FREQ.Hz(),
-                    PLL_SYS_125MHZ,
-                ) {
-                    Ok(p) => p,
-                    Err(_) => crate::panic!("Couldn't get disabled PLL"),
-                };
-                pll_sys.1 = Some(pll_disabled);
-                debug_pin.set_low().unwrap();
-            }
-            if let Some(xosc_enabled) = xosc.0.take() {
-                debug_pin.set_low().unwrap();
-                lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
-                lepton
-                    .spi
-                    .vsync
-                    .set_interrupt_enabled(Interrupt::EdgeHigh, false);
-                lepton
-                    .spi
-                    .vsync
-                    .set_interrupt_enabled_dormant_wake(Interrupt::EdgeHigh, true); // 0x00080000 - IO_BANK0_DORMANT_WAKE_INTE3_GPIO28_EDGE_HIGH
-                lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
-                let dormant_xosc = unsafe { xosc_enabled.dormant() };
-                lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
-
-                let disabled_xosc = CrystalOscillator::new(dormant_xosc.free());
-                let initialized_xosc;
-                match disabled_xosc.initialize(XOSC_CRYSTAL_FREQ.Hz()) {
-                    Ok(x) => initialized_xosc = x,
-                    Err(_) => crate::panic!("Foo"),
-                };
-                let xosc_stable_token;
-                loop {
-                    let res = initialized_xosc.await_stabilization();
-                    if let Ok(res) = res {
-                        xosc_stable_token = res;
-                        break;
-                    }
-                }
-
-                xosc.0 = Some(initialized_xosc.get_stable(xosc_stable_token));
-                lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
-                lepton
-                    .spi
-                    .vsync
-                    .set_interrupt_enabled(Interrupt::EdgeHigh, true);
-                lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
-                lepton
-                    .spi
-                    .vsync
-                    .set_interrupt_enabled_dormant_wake(Interrupt::EdgeHigh, false);
-                debug_pin.set_high().unwrap();
-            }
-
-            //info!("Waking up");
-            // if let Some(pll_disabled) = pll_sys.1.take() {
-            //     let mut peripherals = unsafe { pac::Peripherals::steal() };
-            //     let initialized_pll = pll_disabled.initialize(&mut peripherals.RESETS);
-            //     let locked_pll_token;
-            //     loop {
-            //         match initialized_pll.await_lock() {
-            //             Ok(l) => {
-            //                 locked_pll_token = l;
-            //                 break;
-            //             }
-            //             Err(_) => {}
-            //         }
-            //     }
-
-            //     let pll_sys_locked = initialized_pll.get_locked(locked_pll_token);
-
-            //     clocks
-            //         .system_clock
-            //         .configure_clock(&pll_sys_locked, pll_sys_locked.get_freq())
-            //         .unwrap();
-
-            //     // CLK PERI = clk_sys. Used as reference clock for Peripherals. No dividers so just select and enable
-            //     // Normally choose clk_sys or clk_usb
-            //     clocks
-            //         .peripheral_clock
-            //         .configure_clock(&clocks.system_clock, clocks.system_clock.freq())
-            //         .unwrap();
-            //     clocks.peripheral_clock.enable();
-            //     pll_sys.0 = Some(pll_sys_locked);
-            //     debug_pin.set_low().unwrap();
-            // }
-        }
-    }
-}
-
-//#[interrupt]
-//fn IO_IRQ_BANK0() {
-/*
-// TODO: Once we're synced, we should be able to immediately ignore certain interrupts.
-
-// Vsync interrupt
-static mut LOCAL_LEPTON_STATE: InterruptState = None;
-
-if LOCAL_LEPTON_STATE.is_none() {
-    critical_section::with(|cs| {
-        *LOCAL_LEPTON_STATE = GLOBAL_LEPTON_STATE.borrow(cs).take();
-    });
-}
-
-if let Some((
-    lepton,
-    led_pin,
-    delay,
-    sio,
-    vo_spi_state,
-    timer,
-    debug_pin,
-    clocks,
-    xosc,
-    rosc,
-    pll_sys,
-    pll_usb,
-    watchdog,
-)) = LOCAL_LEPTON_STATE
-{
-    // We need to recover from dormant here:
-    led_pin.set_low().unwrap();
-    if let Some(pll_sys_disabled) = pll_sys.1.take() {
-        let mut peripherals = unsafe { pac::Peripherals::steal() };
-        //info!("Waking up");
-        let initialized_pll = pll_sys_disabled.initialize(&mut peripherals.RESETS);
-        let locked_pll_token;
-        loop {
-            match initialized_pll.await_lock() {
-                Ok(l) => {
-                    locked_pll_token = l;
-                    break;
-                }
-                Err(_) => {}
-            }
-        }
-        led_pin.set_low().unwrap();
-
-        let pll_sys_locked = initialized_pll.get_locked(locked_pll_token);
-
-        clocks
-            .system_clock
-            .configure_clock(&pll_sys_locked, pll_sys_locked.get_freq())
-            .unwrap();
-
-        // CLK PERI = clk_sys. Used as reference clock for Peripherals. No dividers so just select and enable
-        // Normally choose clk_sys or clk_usb
-        clocks
-            .peripheral_clock
-            .configure_clock(&clocks.system_clock, clocks.system_clock.freq())
-            .unwrap();
-
-        pll_sys.0 = Some(pll_sys_locked);
-    }
-
-    //if lepton.spi.vsync.interrupt_status(Interrupt::EdgeHigh) {
-    let start = MicroSecondsInstant::from_ticks(timer.get_counter_low());
-    //lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
-    if lepton.is_resetting() {
-        warn!("Got vsync during reset");
-    }
-    // Our interrupt doesn't clear itself.
-    // Do that now so we don't immediately jump back to this interrupt handler.
-
-    critical_section::with(|cs| {
-        let mut frame = FRAME_BUFFER.frame_0.borrow(cs).borrow_mut();
-        let _ = debug_pin.set_high();
-
-        vo_spi_state.started_segment = false;
-        let mut discards_before_first_good = 0;
-        loop {
-            let mut buffer = [0u16; 82];
-            let packet = lepton.transfer(&mut buffer).unwrap();
-
-            let packet_header = packet[0];
-            let is_discard_packet = packet_header & 0x0f00 == 0x0f00;
-            if is_discard_packet {
-                discards_before_first_good += 1;
-                continue;
-            }
-            let packet_id = (packet_header & 0x0fff) as isize;
-            if packet_id == 0 {
-                vo_spi_state.prev_packet_id = -1;
-                vo_spi_state.started_segment = true;
-                frame.telemetry.process_time = 0;
-            } else if packet_id == 20 {
-                // Packet 20 is the only one that contains a meaningful segment number
-                let segment_num = packet_header >> 12;
-                // See if we're starting a frame, or ending it.
-                if vo_spi_state.current_segment_num > 0
-                    && vo_spi_state.current_segment_num < 4
-                    && segment_num != vo_spi_state.current_segment_num
-                {
-                    // Segment order mismatch.
-                    warn!(
-                        "Segment order mismatch error: stored {}, this {}",
-                        vo_spi_state.current_segment_num, segment_num
-                    );
-                    vo_spi_state.reset();
-                    // Reset and resync
-                    lepton.wait_for_ready(delay);
-                    lepton.reset(delay);
-
-                    let end = MicroSecondsInstant::from_ticks(timer.get_counter_low());
-                    let elapsed = end.checked_duration_since(start).unwrap().ticks();
-                    frame.telemetry.process_time += elapsed;
-
-                    break;
-                }
-                vo_spi_state.current_segment_num = segment_num;
-                if vo_spi_state.current_segment_num == 0 {
-                    vo_spi_state.started_segment = false;
-                }
-            }
-            if vo_spi_state.started_segment {
-                if packet_id != vo_spi_state.prev_packet_id + 1 {
-                    // Packet order mismatch
-                    warn!(
-                        "Packet order mismatch current: {}, prev: {}, seg {}",
-                        packet_id,
-                        vo_spi_state.prev_packet_id,
-                        vo_spi_state.current_segment_num
-                    );
-                    vo_spi_state.reset();
-
-                    if vo_spi_state.packet_id_mismatches > 3 {
-                        vo_spi_state.packet_id_mismatches = 0;
-                        let now = MicroSecondsInstant::from_ticks(timer.get_counter_low());
-                        let last =
-                            MicroSecondsInstant::from_ticks(vo_spi_state.last_reboot_time);
-                        let elapsed = now.checked_duration_since(last).unwrap().ticks();
-                        warn!(
-                            "{} prior reboots, last was {} mins ago, {} frames ago",
-                            vo_spi_state.reboots,
-                            elapsed / 1000 / 1000 / 60,
-                            frame.telemetry.count
-                        );
-                        vo_spi_state.reboots += 1;
-                        vo_spi_state.last_reboot_time = timer.get_counter_low();
-                        lepton.reboot(delay, false);
-                        break;
-                    }
-                    // Reset and resync - do we need to disable vsync in here so we don't keep entering this function?
-                    lepton.reset(delay);
-                    vo_spi_state.packet_id_mismatches += 1;
-
-                    let end = MicroSecondsInstant::from_ticks(timer.get_counter_low());
-                    let elapsed = end.checked_duration_since(start).unwrap().ticks();
-                    frame.telemetry.process_time += elapsed;
-                    let _ = debug_pin.set_low();
-                    break;
-                }
-                let is_last_segment = vo_spi_state.current_segment_num == 4;
-                if packet_id < 61 && !is_last_segment || packet_id < 57 && is_last_segment {
-                    // Write packet out to frame buffer
-                    let packet_id = packet_id as usize;
-
-                    let segment_offset = (u16::max(vo_spi_state.current_segment_num, 1) - 1)
-                        as usize
-                        * SEGMENT_LENGTH;
-                    let side = packet_id % 2; // + (*current_segment_num - 1) as usize % 2) % 2;
-                    let y = (packet_id - side) >> 1;
-                    let offset = segment_offset + (y * 160) + (80 * side);
-                    frame.frame[offset..offset + 80].copy_from_slice(&packet[2..]);
-                }
-                if packet_id == 60 && !is_last_segment {
-                    // Increment in good faith if we're on the last packet of a valid segment
-                    vo_spi_state.current_segment_num += 1;
-
-                    let end = MicroSecondsInstant::from_ticks(timer.get_counter_low());
-                    let elapsed = end.checked_duration_since(start).unwrap().ticks();
-                    frame.telemetry.process_time += elapsed;
-
-                    break;
-                }
-                if packet_id == 57 && is_last_segment {
-                    //let _ = led_pin.toggle();
-                    // let _ = debug_pin.toggle();
-
-                    // FIXME: These numbers seem to be junk.  Confirm that we actually have TLinear on, and they're
-                    // not actually a scaled 14bit value!  Could they be values from before image processing?
-                    // If we turn TLinear off, do they match up?
-                    let frame_stats = lepton.scene_stats(delay);
-                    frame.telemetry.min_value = frame_stats.min;
-                    frame.telemetry.max_value = frame_stats.max;
-                    frame.telemetry.avg_value = frame_stats.avg;
-
-                    // TODO - Maybe also get the spot-meter roi here?
-
-                    // Read out four telemetry packets (including the current one) and parse them.
-
-                    // frame counter
-                    let frame_counter =
-                        LittleEndian::read_u32(&packet[2..][20..=21].as_byte_slice());
-                    frame.telemetry.count = frame_counter;
-
-                    // Grab two more telemetry rows, and discard
-                    lepton.transfer(&mut buffer).unwrap(); // packet 58
-                    lepton.transfer(&mut buffer).unwrap(); // packet 59
-                    let spot_meter_avg = buffer[2..][50];
-                    let spot_meter_max = buffer[2..][51];
-                    let spot_meter_min = buffer[2..][52];
-                    frame.telemetry.spot_avg = spot_meter_avg;
-                    frame.telemetry.spot_min = spot_meter_min;
-                    frame.telemetry.spot_max = spot_meter_max;
-
-                    let spot_start_y = buffer[2..][54];
-                    let spot_start_x = buffer[2..][55];
-                    let spot_end_y = buffer[2..][56];
-                    let spot_end_x = buffer[2..][57];
-                    // info!(
-                    //     "spot {}, {}, {}, {}",
-                    //     spot_start_x, spot_end_x, spot_start_y, spot_end_y
-                    // );
-
-                    // Not sure if we need this last one?
-                    //lepton.transfer(&mut buffer).unwrap(); // packet 60
-
-                    // Get additional frame stats from CCI.
-                    let focus_metric = lepton.get_focus_metric(delay);
-                    frame.telemetry.focus_metric = focus_metric;
-
-                    let end = MicroSecondsInstant::from_ticks(timer.get_counter_low());
-                    let elapsed = end.checked_duration_since(start).unwrap().ticks();
-                    frame.telemetry.process_time += elapsed;
-                    // Pass control of frame to other core for further processing.
-
-                    //sio.write(1);
-
-                    break;
-                }
-            }
-            vo_spi_state.prev_packet_id = packet_id;
-        }
-        let _ = debug_pin.set_low();
-    });
-    //}
-
-    // NOTE: We really want to do this on the other core, once we're finished.
-
-    // NOTE: Unfortunately going into dormant terminates our debugger session prematurely.
-
-    clocks.peripheral_clock.disable();
-    let xosc_stable = xosc.0.take().unwrap();
-    //let rosc_stable = rosc.0.take().unwrap();
-
-    // FIXME We may need to be able to set *no* auxsrc here.
-    // clocks
-    //     .reference_clock
-    //     .configure_clock(&rosc_stable, XOSC_CRYSTAL_FREQ.Hz())
-    //     .unwrap();
-
-    // clocks
-    //     .system_clock
-    //     .configure_clock(&rosc_stable, XOSC_CRYSTAL_FREQ.Hz())
-    //     .unwrap();
-    while clocks.system_clock.reset_source_await().is_err() {}
-    while clocks.reference_clock.reset_source_await().is_err() {}
-    let pll_sys_taken = pll_sys.0.take().unwrap();
-
-    //info!("{:?}", pll_sys_taken.);
-    let pll_sys_disabled = pll_sys_taken.free();
-
-    {
-        //info!("Disable PLL_SYS");
-        // Actually disable
-
-        pll_sys_disabled.pwr.reset();
-
-        pll_sys_disabled.fbdiv_int.reset();
-
-        // pll_sys_disabled.cs.write(|w| unsafe {
-        //     w.refdiv().bits(1);
-        //     w
-        // });
-
-        // let ref_freq_hz: HertzU32 = XOSC_CRYSTAL_FREQ.Hz();
-        // let vco_freq = PLL_SYS_125MHZ.vco_freq;
-
-        // let fbdiv: u16 = vco_freq.to_Hz().checked_div(ref_freq_hz.to_Hz()).unwrap() as u16;
-
-        // pll_sys_disabled.fbdiv_int.write(|w| unsafe {
-        //     w.fbdiv_int().bits(fbdiv);
-        //     w
-        // });
-    }
-
-    let pll_disabled =
-        match PhaseLockedLoop::new(pll_sys_disabled, XOSC_CRYSTAL_FREQ.Hz(), PLL_SYS_125MHZ) {
-            Ok(p) => p,
-            Err(_) => crate::panic!("Couldn't get disabled PLL"),
-        };
-    pll_sys.1 = Some(pll_disabled);
-
-    //info!("Going dormant");
-    //xosc.0 = Some(xosc_stable);
-    //delay.delay_ms(10);
-    //led_pin.set_high().unwrap();
-    xosc.1 = Some(unsafe { xosc_stable.dormant() });
-
-    if let Some(dormant_xosc) = xosc.1.take() {
-        let disabled_xosc = CrystalOscillator::new(dormant_xosc.free());
-        let initialized_xosc;
-        match disabled_xosc.initialize(XOSC_CRYSTAL_FREQ.Hz()) {
-            Ok(x) => initialized_xosc = x,
-            Err(_) => crate::panic!("Foo"),
-        };
-        // let initialized_xosc =
-        //     unsafe { dormant_xosc.initialize_from_dormant_wake(XOSC_CRYSTAL_FREQ.Hz()) };
-
-        // if initialized_xosc.has_bad_bit() {
-        //     led_pin.set_low().unwrap();
-        // }
-        if initialized_xosc.enabled() {
-            led_pin.set_high().unwrap();
-        }
-        let xosc_stable_token;
-        loop {
-            let res = initialized_xosc.await_stabilization();
-            if let Ok(res) = res {
-                xosc_stable_token = res;
-                break;
-            }
-        }
-        lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
-        let xosc_stable = initialized_xosc.get_stable(xosc_stable_token);
-        xosc.0 = Some(xosc_stable);
-    }
-
-    // clocks
-    //     .system_clock
-    //     .configure_clock(pll_sys, 125_000_000.Hz())
-    //     .unwrap();
-    // Wake up again
-    // When we return here, we will be awake, and have a CrystalOscillator<Enabled>, and we need to transition it to stable.
-}
-*/
-//}
-
 #[entry]
 fn main() -> ! {
     info!("Program start");
 
-    ///
-    let mut peripherals = pac::Peripherals::take().unwrap();
-    let mut watchdog = Watchdog::new(peripherals.WATCHDOG);
-    const XOSC_CRYSTAL_FREQ: u32 = 12_000_000; // Typically found in BSP crates
+    // Rosc measured speed seems to be 145_332_000 - see how this varies between boards.
+    let rosc_clock_freq: HertzU32 = 133_000_000.Hz();
 
-    // let rosc = RingOscillator::new(peripherals.ROSC);
-    // let rosc = rosc.initialize();
-    // let rosc = rosc.disable();
-    // Enable the xosc
-    let mut xosc = match setup_xosc_blocking(peripherals.XOSC, XOSC_CRYSTAL_FREQ.Hz()) {
+    // Seems to give a reported baud-rate of 22Mhz, in practice it may be lower, since we're seeing 2MB/s transfers,
+    // and at 20Mhz we'd expect a maximum of 2.5MB/s
+    let spi_clock_freq: HertzU32 = 25_000_000.Hz();
+
+    let mut peripherals = Peripherals::take().unwrap();
+    //Enable the xosc, so that we can measure the rosc clock speed
+    let xosc = match setup_xosc_blocking(peripherals.XOSC, XOSC_CRYSTAL_FREQ.Hz()) {
         Ok(xosc) => xosc,
         Err(_) => crate::panic!("xosc"),
     };
-
-    // Start tick in watchdog
-    watchdog.enable_tick_generation((XOSC_CRYSTAL_FREQ / 1_000_000) as u8);
-
     let mut clocks = ClocksManager::new(peripherals.CLOCKS);
 
-    // Configure PLLs
-    //                   REF     FBDIV VCO            POSTDIV
-    // PLL SYS: 12 / 1 = 12MHz * 125 = 1500MHZ / 6 / 2 = 125MHz
-    // PLL USB: 12 / 1 = 12MHz * 40  = 480 MHz / 5 / 2 =  48MHz
-    let mut pll_sys = match setup_pll_blocking(
-        peripherals.PLL_SYS,
-        xosc.operating_frequency().into(),
-        PLL_SYS_125MHZ,
-        &mut clocks,
-        &mut peripherals.RESETS,
-    ) {
-        Ok(pll_sys) => pll_sys,
-        Err(_) => crate::panic!("pll_sys"),
-    };
+    clocks
+        .reference_clock
+        .configure_clock(&xosc, XOSC_CRYSTAL_FREQ.Hz())
+        .unwrap();
 
-    // Configure clocks
-    // CLK_REF = XOSC (12MHz) / 1 = 12MHz
-    // CLK SYS = PLL SYS (125MHz) / 1 = 125MHz
-    clocks.usb_clock.disable();
-    clocks.adc_clock.disable();
-    clocks.rtc_clock.disable();
+    let rosc = RingOscillator::new(peripherals.ROSC);
+    let mut rosc = rosc.initialize();
 
     clocks
         .system_clock
-        .configure_clock(&pll_sys, pll_sys.get_freq())
+        .configure_clock(&rosc, rosc.get_freq())
+        .unwrap();
+    info!("Rosc speed {}", utils::rosc_frequency_count_hz());
+    // Now raise the clock speed of rosc.
+    rosc.set_operating_frequency(rosc_clock_freq);
+
+    clocks
+        .system_clock
+        .configure_clock(&rosc, rosc.get_freq())
         .unwrap();
 
-    // CLK PERI = clk_sys. Used as reference clock for Peripherals. No dividers so just select and enable
-    // Normally choose clk_sys or clk_usb
+    let measured_speed = utils::rosc_frequency_count_hz();
+    info!("Measured {}, asked for {}", measured_speed, rosc_clock_freq.to_Hz());
+    // Do this a few more times until the rosc speed is close to the actual speed measured.
+
+    info!("System clock speed {}", clocks.system_clock.freq().to_MHz());
+    let _xosc_disabled = xosc.disable();
+    clocks.usb_clock.disable();
+    clocks.adc_clock.disable();
+    clocks.rtc_clock.disable();
     clocks
         .peripheral_clock
         .configure_clock(&clocks.system_clock, clocks.system_clock.freq())
         .unwrap();
 
-    ////
-
     let core = pac::CorePeripherals::take().unwrap();
-
     let mut sio = Sio::new(peripherals.SIO);
     let mut mc = Multicore::new(&mut peripherals.PSM, &mut peripherals.PPB, &mut sio.fifo);
     let cores = mc.cores();
@@ -803,52 +266,19 @@ fn main() -> ! {
         sio.gpio_bank0,
         &mut peripherals.RESETS,
     );
-
-    {
-        // info!("=== Init LCD ===");
-        // let lcd: Lcd = {
-        //     let _lcd_mosi: Pin<Gpio19, FunctionSpi> = pins.gpio19.into_mode();
-        //     let _lcd_clk: Pin<Gpio18, FunctionSpi> = pins.gpio18.into_mode();
-        //     let lcd_dc = pins.gpio20.into_push_pull_output(); // spi tx
-        //     let lcd_rst = pins.gpio22.into_push_pull_output(); // spi sck
-        //     let lcd_cs = pins.gpio17.into_push_pull_output(); // spi cs
-        //     let lcd_spi: Spi<_, _, 8> = Spi::new(pac.SPI0).init(
-        //         &mut pac.RESETS,
-        //         clocks.peripheral_clock.freq(), // 125_000_000
-        //         48_000_000u32.Hz(),
-        //         &embedded_hal::spi::MODE_0,
-        //     );
-        //     let spi_iface = SPIInterface::new(lcd_spi, lcd_dc, lcd_cs);
-        //     let lcd = Ili9341::new(
-        //         spi_iface,
-        //         lcd_rst,
-        //         &mut delay,
-        //         Orientation::PortraitFlipped,
-        //         DisplaySize240x320,
-        //     )
-        //     .unwrap();
-        //     lcd
-        // };
-
-        // let debug_render_pin: Pin<Gpio26, Output<PushPull>> = pins.gpio26.into_push_pull_output();
-
-        // let _ = core1.spawn(unsafe { &mut CORE1_STACK.mem }, move || {
-        //     // Get the second core's copy of the `CorePeripherals`, which are per-core.
-        //     // Unfortunately, `cortex-m` doesn't support this properly right now,
-        //     // so we have to use `steal`.
-        //     info!("Init Core 1");
-        //     let mut pac = unsafe { pac::Peripherals::steal() };
-        //     let _core = unsafe { pac::CorePeripherals::steal() };
-        //     let sio = Sio::new(pac.SIO);
-        //     // Set up the delay for the second core.
-        //     //let delay = Delay::new(core.SYST, sys_freq);
-        //     let timer = Timer::new(pac.TIMER, &mut pac.RESETS);
-        //     handle_drawing_output(lcd, sio, timer, debug_render_pin);
-        // });
-    }
     let mut enable_pin = pins.gpio2.into_push_pull_output();
+    let mut debug_awake_pin: Pin<Gpio27, Output<PushPull>> = pins.gpio27.into_push_pull_output();
+    let mut debug_frame_read_pin = pins.gpio26.into_push_pull_output();
     enable_pin.set_high().unwrap();
-    let mut lepton = lepton::Lepton::new(
+
+    info!("Freq {:?}", clocks.peripheral_clock.freq().to_Hz());
+    let (spi, speed) = Spi::new(peripherals.SPI1).init(
+        &mut peripherals.RESETS,
+        clocks.peripheral_clock.freq(), // 125_000_000
+        spi_clock_freq,
+        &embedded_hal::spi::MODE_3,
+    );
+    let mut lepton = Lepton::new(
         rp_pico::hal::I2C::i2c0(
             peripherals.I2C0,
             pins.gpio12.into_mode(),
@@ -857,124 +287,132 @@ fn main() -> ! {
             &mut peripherals.RESETS,
             clocks.peripheral_clock.freq(),
         ),
-        Spi::new(peripherals.SPI1).init(
-            &mut peripherals.RESETS,
-            clocks.peripheral_clock.freq(), // 125_000_000
-            20_000_000.Hz(),
-            &embedded_hal::spi::MODE_3,
-        ),
+        spi,
         pins.gpio9.into_push_pull_output(),
         pins.gpio11.into_push_pull_output(),
         pins.gpio8.into_mode(),
         pins.gpio10.into_mode(),
         pins.gpio3.into_mode(),
     );
+    info!("Baud-rate {:?}", speed.to_MHz());
     let timer = Timer::new(peripherals.TIMER, &mut peripherals.RESETS);
     // Reboot every time we start up the program to get to a known state.
-
     lepton.reboot(&mut delay, true);
 
-    let mut alt_pin = pins.gpio26.into_push_pull_output();
-    let mut led_pin: LedPin = pins.led.into_push_pull_output();
-    //let _ = led_pin.set_low();
-    let debug_pin: Pin<Gpio27, Output<PushPull>> = pins.gpio27.into_push_pull_output();
     lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
-    //peripherals.IO_BANK0.dormant_wake_inte
-    // FIXME - Need to set this
-    //DORMANT_WAKE_INTE.
-    critical_section::with(|cs| {
-        GLOBAL_LEPTON_STATE.borrow(cs).replace(Some((
-            lepton,
-            led_pin,
-            delay,
-            sio.fifo,
-            VoSpiState::new(),
-            timer,
-            debug_pin,
-            clocks,
-            (Some(xosc), None),
-            (None, None),
-            (Some(pll_sys), None),
-            (None, None),
-            watchdog,
-        )));
-    });
-    alt_pin.set_high().unwrap();
-    unsafe {
-        pac::NVIC::unmask(pac::Interrupt::IO_IRQ_BANK0);
+    // Set wake from dormant on vsync
+    lepton
+        .spi
+        .vsync
+        .set_interrupt_enabled_dormant_wake(Interrupt::EdgeHigh, true);
+    debug_frame_read_pin.set_high().unwrap();
+    let mut vo_spi_state = VoSpiState::new();
+    let start = MicroSecondsInstant::from_ticks(timer.get_counter_low());
+    let mut last_segment_was_4 = false;
+    let mut got_sync = false;
+    let mut skipped_segs = 0;
+    warn!("Syncing");
+    while !got_sync {
+        lepton.get_frame_sync(&mut vo_spi_state, &mut delay, &timer, start, &mut got_sync);
     }
-    // led_pin.set_high().unwrap();
-    // info!("Sleeping");
-    // delay.delay_ms(50);
-    /*
-    loop {
-        let pll_sys_disabled = pll_sys.free();
-        pll_sys_disabled.pwr.reset();
-        //pll_sys_disabled.fbdiv_int.reset();
+    warn!("Got sync, entering frame/sleep loop");
 
-        let pll_disabled =
-            match PhaseLockedLoop::new(pll_sys_disabled, XOSC_CRYSTAL_FREQ.Hz(), PLL_SYS_125MHZ) {
-                Ok(p) => p,
-                Err(_) => crate::panic!("Couldn't get disabled PLL"),
-            };
+    let mut buffer = [0u16; 82];
+    let mut n_frames = 0;
 
-        let dormant_xosc = unsafe { xosc.dormant() };
+    let mut prev_packet_id = -1;
 
-        led_pin.set_low().unwrap();
-        let disabled_xosc = CrystalOscillator::new(dormant_xosc.free());
-        let initialized_xosc;
-        match disabled_xosc.initialize(XOSC_CRYSTAL_FREQ.Hz()) {
-            Ok(x) => initialized_xosc = x,
-            Err(_) => crate::panic!("Foo"),
-        };
-        let xosc_stable_token;
+    'frame_loop: loop {
+        debug_awake_pin.set_low().unwrap();
+        // NOTE: Go into dormant state
+        let dormant_rosc = unsafe { rosc.dormant() };
+
+        // NOTE: We got an interrupt on Vsync pin, now we're waking up again!
+        //  Re-enable the rosc so we can resume operation.
+        let disabled_rosc = RingOscillator::new(dormant_rosc.free());
+        let initialized_rosc = disabled_rosc.initialize();
+        rosc = initialized_rosc;
+        debug_awake_pin.set_high().unwrap();
         lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
 
-        loop {
-            let res = initialized_xosc.await_stabilization();
-            if let Ok(res) = res {
-                xosc_stable_token = res;
-                break;
-            }
+        let mut discards_before_first_good = 0;
+        let mut segment_num = 0;
+
+        if last_segment_was_4 {
+            skipped_segs += 1;
         }
+        if last_segment_was_4 && skipped_segs < 8 {
+            // NOTE: After segment 4 of a frame, there are 7 segments that can be skipped
+            //  completely before the next real frame starts.  Contrary to the lepton documentation,
+            //  sync is not lost if we decide to just ignore these rather than clocking out their
+            //  data packets, and doing this saves power.
+            //  On the 8th segment, which is the last junk segment before we start getting real ones,
+            //  we wake up and start getting rid of the discard buffer.  If we skipped the 8th segment,
+            //  we wouldn't have time to catch up after discarding all the junk packets, due to the
+            //  limited SPI bandwidth available.
+            continue 'frame_loop;
+        }
+        skipped_segs = 0;
+        if last_segment_was_4 {
+            // NOTE: We've successfully read out at least one frame, and have skipped 7 of the 8
+            //  blank segments.  Now we still have a bunch of discards that are buffered up, since
+            //  the lepton buffers N (where N is some number in the low hundreds) packets so that
+            //  reads can be delayed somewhat and still catch up and maintain sync.  Here we just
+            //  wait a little bit longer before starting to read out packets so that the number
+            //  we have to read out only to discard is lower (around 25), which saves some power.
+            delay.delay_us(5100);
 
-        //lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
-        xosc = initialized_xosc.get_stable(xosc_stable_token);
-        delay.delay_ms(5);
-
-        //info!("Waking up");
-        let initialized_pll = pll_disabled.initialize(&mut peripherals.RESETS);
-        let locked_pll_token;
-        loop {
-            match initialized_pll.await_lock() {
-                Ok(l) => {
-                    locked_pll_token = l;
-                    break;
+            // Indicate that we're starting to read out a new frame
+            debug_frame_read_pin.set_high().unwrap();
+        }
+        // NOTE: - it's possible to greedily clock out all 4 segments in the first vsync pulse, but
+        //  the lepton module seems to not be able to feed all 4 segments out cleanly, so it outputs
+        //  a couple of dozen discard packets before each frame segment.  This uses slightly more
+        //  power to read out sequentially than just waiting for the vsync pulse for each segment,
+        //  processing it with no discards, and then going dormant again.
+        rosc.set_operating_frequency(rosc_clock_freq);
+        lepton.cs_low();
+        lepton.start_clock(clocks.peripheral_clock.freq(), spi_clock_freq);
+        'scanline: loop {
+            // Read out 1 scanline of the video frame
+            let packet = lepton.transfer_block(&mut buffer).unwrap();
+            let packet_header = packet[0];
+            let is_discard_packet = packet_header & 0x0f00 == 0x0f00;
+            if is_discard_packet {
+                discards_before_first_good += 1;
+                continue 'scanline;
+            }
+            let packet_id = (packet_header & 0x0fff) as isize;
+            if packet_id != prev_packet_id + 1 && segment_num != 0 {
+                warn!("Expected {}, got {}", prev_packet_id + 1, packet_id);
+            }
+            prev_packet_id = packet_id;
+            if packet_id == 20 {
+                // NOTE: Packet 20 is the only packet that has a valid segment id in its header.
+                segment_num = packet_header >> 12;
+                if segment_num == 1 {
+                    got_sync = true;
                 }
-                Err(_) => {}
+            }
+            if packet_id == 60 {
+                prev_packet_id = -1;
+                last_segment_was_4 = segment_num == 4;
+            }
+            if packet_id == 60  { // NOTE: To clock out all segments at once: && (segment_num == 4 || !started)
+                if segment_num == 4 {
+                    // We've finished reading out the frame.
+                    debug_frame_read_pin.set_low().unwrap();
+
+                    // TODO: Work out how to successfully come out of power-off mode for the lepton
+                    //  - This may require a board with access to the reset and pwr pins, rather
+                    //  than just "enable"
+                }
+                break 'scanline;
             }
         }
-
-        let pll_sys_locked = initialized_pll.get_locked(locked_pll_token);
-
-        clocks
-            .system_clock
-            .configure_clock(&pll_sys_locked, pll_sys_locked.get_freq())
-            .unwrap();
-
-        // CLK PERI = clk_sys. Used as reference clock for Peripherals. No dividers so just select and enable
-        // Normally choose clk_sys or clk_usb
-        clocks
-            .peripheral_clock
-            .configure_clock(&clocks.system_clock, clocks.system_clock.freq())
-            .unwrap();
-        pll_sys = pll_sys_locked;
-
-        //cortex_m::asm::wfi();
-        // We just got woken by the interrupt, now recover.
-    }
-    */
-    loop {
-        cortex_m::asm::wfi();
+        // Setting the lepton baud-rate to 0 while dormant seems to help with power usage a tiny bit.
+        lepton.stop_clock();
+        lepton.cs_high();
+        lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
     }
 }
