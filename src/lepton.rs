@@ -2,16 +2,16 @@ use core::convert::Infallible;
 
 use byte_slice_cast::AsByteSlice;
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use cortex_m::asm::nop;
 use cortex_m::prelude::{_embedded_hal_blocking_i2c_Write, _embedded_hal_blocking_spi_Transfer};
 use cortex_m::{delay::Delay, prelude::_embedded_hal_blocking_i2c_WriteRead};
-use cortex_m::asm::nop;
 use defmt::{info, warn};
 use embedded_hal::digital::v2::{OutputPin, ToggleableOutputPin};
 use fugit::{HertzU32, RateExtU32};
 
 use rp2040_hal::gpio::bank0::{Gpio3, Gpio5};
-use rp2040_hal::{pac, Sio, Timer};
 use rp2040_hal::gpio::Pins;
+use rp2040_hal::{pac, Sio, Timer};
 use rp_pico::hal::gpio::bank0::{Gpio10, Gpio11, Gpio28, Gpio8, Gpio9};
 use rp_pico::hal::gpio::{FloatingInput, FunctionSpi, Interrupt, Output, PushPull};
 use rp_pico::hal::spi::Enabled;
@@ -174,7 +174,7 @@ pub struct Lepton {
     pub spi: LeptonSpi,
     cci: LeptonCCI,
     resetting: bool,
-    clock_running: bool
+    clock_running: bool,
 }
 
 impl Lepton {
@@ -198,7 +198,7 @@ impl Lepton {
             },
             cci: LeptonCCI { i2c },
             resetting: false,
-            clock_running: true
+            clock_running: true,
         }
     }
 
@@ -323,14 +323,12 @@ impl Lepton {
     }
 
     pub fn power_down(&mut self) {
-        self.execute_command(
-            lepton_command(
-                LEPTON_SUB_SYSTEM_OEM,
-                LEPTON_OEM_POWER_DOWN,
-                LeptonCommandType::Run,
-                true,
-            ),
-        );
+        self.execute_command(lepton_command(
+            LEPTON_SUB_SYSTEM_OEM,
+            LEPTON_OEM_POWER_DOWN,
+            LeptonCommandType::Run,
+            true,
+        ));
     }
 
     pub fn power_on(&mut self) {
@@ -352,15 +350,7 @@ impl Lepton {
         }
         scl.toggle().unwrap();
 
-        let _ = self.cci.i2c.write(
-            LEPTON_ADDRESS,
-            &[
-                0,
-                0,
-                0,
-                0,
-            ],
-        );
+        let _ = self.cci.i2c.write(LEPTON_ADDRESS, &[0, 0, 0, 0]);
         //self.wait_for_ready(true);
     }
 
@@ -581,26 +571,22 @@ impl Lepton {
     }
 
     pub fn ping(&mut self) -> bool {
-        self.execute_command(
-            lepton_command(
-                LEPTON_SUB_SYSTEM_SYS,
-                LEPTON_SYS_PING_CAMERA,
-                LeptonCommandType::Run,
-                false,
-            ),
-        )
+        self.execute_command(lepton_command(
+            LEPTON_SUB_SYSTEM_SYS,
+            LEPTON_SYS_PING_CAMERA,
+            LeptonCommandType::Run,
+            false,
+        ))
     }
 
     pub fn reboot(&mut self, delay: &mut Delay, wait: bool) -> bool {
         warn!("Rebooting lepton module");
-        let ok = self.execute_command(
-            lepton_command(
-                LEPTON_SUB_SYSTEM_OEM,
-                LEPTON_OEM_REBOOT,
-                LeptonCommandType::Run,
-                true,
-            ),
-        );
+        let ok = self.execute_command(lepton_command(
+            LEPTON_SUB_SYSTEM_OEM,
+            LEPTON_OEM_REBOOT,
+            LeptonCommandType::Run,
+            true,
+        ));
         info!("Waiting 5 seconds");
         delay.delay_ms(5000);
         self.init(delay);
@@ -684,10 +670,7 @@ impl Lepton {
         }
     }
 
-    fn execute_command(
-        &mut self,
-        (command, _length): LeptonSynthesizedCommand,
-    ) -> bool {
+    fn execute_command(&mut self, (command, _length): LeptonSynthesizedCommand) -> bool {
         self.wait_for_ready(false);
         self.wait_for_ffc_status_ready();
         let result = self.cci.i2c.write(
@@ -706,7 +689,6 @@ impl Lepton {
         // Now read the status register to see if it worked?
         result.is_ok()
     }
-
 
     fn get_attribute(
         &mut self,
@@ -761,11 +743,7 @@ impl Lepton {
         return (buf, length);
     }
 
-    fn set_attribute_i32(
-        &mut self,
-        command: LeptonSynthesizedCommand,
-        val: i32,
-    ) -> bool {
+    fn set_attribute_i32(&mut self, command: LeptonSynthesizedCommand, val: i32) -> bool {
         self.set_attribute(
             command,
             &[(val & 0xffff) as u16, (val >> 16 & 0xffff) as u16],

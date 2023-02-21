@@ -24,19 +24,16 @@ display-interface-spi = "0.4.1"
 numtoa = "0.2.4"
 critical-section = "1.1.0"
 fugit = "0.3.6"
+crc = "3.0.0"
 
 rp2040-hal = { path = "../rp-hal/rp2040-hal" }
 # We're using a Pico by default on this template
-rp-pico = { path = "../rp-hal/boards/rp-pico" }
+rp-pico = { path = "../rp-hal-boards/boards/rp-pico" }
 
 miniz_oxide = { path = "../miniz_oxide/miniz_oxide", default-features = false }
 
-# but you can use any BSP. Uncomment this to use the pro_micro_rp2040 BSP instead
-# sparkfun-pro-micro-rp2040 = "0.3"
-
-# If you're not going to use a Board Support Package you'll need these:
-# rp2040-hal = { version="0.5", features=["rt"] }
-# rp2040-boot2 = "0.2"
+pio = "0.2.1"
+pio-proc = "0.2.1"
 
 # cargo build/run
 [profile.dev]

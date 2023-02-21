@@ -1,16 +1,14 @@
 #![no_std]
 #![no_main]
 
-mod draw_debug_output;
+//mod draw_debug_output;
 mod lepton;
 mod static_string;
 mod utils;
 use bsp::{
     entry,
     hal::{
-        clocks::{
-            Clock, ClockSource, ClocksManager, StoppableClock,
-        },
+        clocks::{Clock, ClockSource, ClocksManager, StoppableClock},
         gpio::{
             bank0::{Gpio17, Gpio18, Gpio20, Gpio22, Gpio26, Gpio27},
             bank0::{Gpio19, Gpio25},
@@ -38,36 +36,49 @@ use bsp::{
     XOSC_CRYSTAL_FREQ,
 };
 
+use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use crc::{Crc, CRC_16_XMODEM};
 use lepton::Lepton;
+use pio::{Instruction, InstructionOperands};
+use rp2040_hal::{
+    dma::{bidirectional, single_buffer, DMAExt},
+    gpio::{BusKeepInput, FloatingInput, Input, PullDownInput, PullUpInput},
+    pio::{PIOBuilder, ShiftDirection},
+    prelude::_rphal_pio_PIOExt,
+};
 use rp_pico as bsp;
 
-use cortex_m::{delay::Delay};
+use cortex_m::{
+    asm::wfi,
+    delay::Delay,
+    prelude::{_embedded_hal_blocking_spi_Transfer, _embedded_hal_spi_FullDuplex},
+};
 use defmt::*;
 use defmt_rtt as _;
 
 use embedded_sdmmc::{TimeSource, Timestamp};
+use fugit::RateExtU32;
 use ili9341::{DisplaySize240x320, Ili9341, Orientation};
-
 use panic_probe as _;
 
 // Provide an alias for our BSP so we can switch targets quickly.
 // Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
 
 // use sparkfun_pro_micro_rp2040 as bsp;
-use fugit::{HertzU32, Instant, RateExtU32};
+use fugit::{HertzU32, Instant};
 
 // Some traits we need
-use embedded_hal::{
-    digital::v2::{OutputPin},
-};
+use embedded_hal::digital::v2::{InputPin, OutputPin, ToggleableOutputPin};
 
-use core::{
-    cell::{RefCell},
-    time::Duration,
-};
-use critical_section::Mutex;
+use core::{borrow::BorrowMut, cell::RefCell, time::Duration};
+use cortex_m::prelude::_embedded_hal_blocking_spi_Write;
+use critical_section::{CriticalSection, Mutex};
+
+use crate::core1::{any_as_u8_slice, core1_task};
 
 static mut CORE1_STACK: Stack<4096> = Stack::new();
+
+mod core1;
 
 pub const SEGMENT_LENGTH: usize = (160 * 122) / 4;
 
@@ -120,6 +131,19 @@ struct Frame {
     telemetry: FrameTelemetry,
 }
 
+pub type FramePacketData = [u8; 160];
+pub struct FrameSeg((u8, [FramePacketData; 61]));
+
+impl FrameSeg {
+    pub const fn new() -> FrameSeg {
+        FrameSeg((0, [[0u8; 160]; 61]))
+    }
+}
+
+struct FrameSegs {
+    frame: [FrameSeg; 4],
+}
+
 impl Frame {
     pub const fn new() -> Frame {
         Frame {
@@ -143,9 +167,9 @@ impl TimeSource for ClockA {
 }
 
 struct TripleBuffer {
-    frame_0: Mutex<RefCell<Frame>>,
-    frame_1: Mutex<RefCell<Frame>>,
-    frame_2: Mutex<RefCell<Frame>>,
+    frame_0: Mutex<RefCell<FrameSeg>>,
+    frame_1: Mutex<RefCell<FrameSeg>>,
+    frame_2: Mutex<RefCell<FrameSeg>>,
 }
 
 impl TripleBuffer {
@@ -159,11 +183,45 @@ impl TripleBuffer {
 
 type LedPin = Pin<Gpio25, PushPullOutput>;
 
-static FRAME_BUFFER: TripleBuffer = TripleBuffer {
-    frame_0: Mutex::new(RefCell::new(Frame::new())),
-    frame_1: Mutex::new(RefCell::new(Frame::new())),
-    frame_2: Mutex::new(RefCell::new(Frame::new())),
+// static FRAME_BUFFER: TripleBuffer = TripleBuffer {
+//     frame_0: Mutex::new(RefCell::new(FrameSeg::new())),
+//     frame_1: Mutex::new(RefCell::new(FrameSeg::new())),
+//     frame_2: Mutex::new(RefCell::new(FrameSeg::new())),
+// };
+
+// struct CorePriority(Mutex<RefCell<usize>>);
+
+// static FIFO: CorePriority = CorePriority(Mutex::new(RefCell::new(0)));
+
+// impl CorePriority {
+//     fn aquire(&self) {
+//         critical_section::with(|cs| {
+//             *self.0.borrow_mut(cs) = 1;
+//         });
+//     }
+
+//     fn release(&self) {
+//         critical_section::with(|cs| *self.0.borrow_mut(cs) = 0);
+//     }
+// }
+
+pub static FRAME_BUFFER: DoubleBuffer = DoubleBuffer {
+    front: Mutex::new(RefCell::new(FrameSeg::new())),
+    back: Mutex::new(RefCell::new(FrameSeg::new())),
 };
+
+pub struct DoubleBuffer {
+    pub front: Mutex<RefCell<FrameSeg>>,
+    pub back: Mutex<RefCell<FrameSeg>>,
+}
+
+impl DoubleBuffer {
+    pub fn swap(&self) {
+        critical_section::with(|cs| {
+            self.front.borrow(cs).swap(self.back.borrow(cs));
+        });
+    }
+}
 
 struct VoSpiState {
     prev_packet_id: isize,
@@ -196,17 +254,21 @@ impl VoSpiState {
 }
 
 type MicroSecondsInstant = Instant<u32, 1, 1_000_000>;
+static mut tx_buf: [u32; 1024] = [0u32; 1024];
 
 #[entry]
 fn main() -> ! {
     info!("Program start");
+    let handoff_to_core_1 = true;
 
     // Rosc measured speed seems to be 145_332_000 - see how this varies between boards.
     let rosc_clock_freq: HertzU32 = 133_000_000.Hz();
+    //let rosc_clock_freq: HertzU32 = 75_000_000.Hz();
+    //let rosc_clock_freq: HertzU32 = 250_000_000.Hz();
 
     // Seems to give a reported baud-rate of 22Mhz, in practice it may be lower, since we're seeing 2MB/s transfers,
     // and at 20Mhz we'd expect a maximum of 2.5MB/s
-    let spi_clock_freq: HertzU32 = 25_000_000.Hz();
+    let spi_clock_freq: HertzU32 = 30_000_000.Hz();
 
     let mut peripherals = Peripherals::take().unwrap();
     //Enable the xosc, so that we can measure the rosc clock speed
@@ -228,8 +290,11 @@ fn main() -> ! {
         .system_clock
         .configure_clock(&rosc, rosc.get_freq())
         .unwrap();
-    info!("Rosc speed {}", utils::rosc_frequency_count_hz());
+
+    let measured_rosc_speed = utils::rosc_frequency_count_hz();
+    info!("Rosc speed {}", measured_rosc_speed);
     // Now raise the clock speed of rosc.
+    //if measured_rosc_speed > 133_000_000 {
     rosc.set_operating_frequency(rosc_clock_freq);
 
     clocks
@@ -238,14 +303,26 @@ fn main() -> ! {
         .unwrap();
 
     let measured_speed = utils::rosc_frequency_count_hz();
-    info!("Measured {}, asked for {}", measured_speed, rosc_clock_freq.to_Hz());
+    info!(
+        "Measured {}, asked for {}",
+        measured_speed,
+        rosc_clock_freq.to_Hz()
+    );
+    //}
     // Do this a few more times until the rosc speed is close to the actual speed measured.
 
     info!("System clock speed {}", clocks.system_clock.freq().to_MHz());
     let _xosc_disabled = xosc.disable();
     clocks.usb_clock.disable();
+    clocks.gpio_output0_clock.disable();
+    clocks.gpio_output1_clock.disable();
+    clocks.gpio_output2_clock.disable();
+    clocks.gpio_output3_clock.disable();
     clocks.adc_clock.disable();
     clocks.rtc_clock.disable();
+
+    // TODO: Are PLLs disabled by default?
+
     clocks
         .peripheral_clock
         .configure_clock(&clocks.system_clock, clocks.system_clock.freq())
@@ -253,9 +330,13 @@ fn main() -> ! {
 
     let core = pac::CorePeripherals::take().unwrap();
     let mut sio = Sio::new(peripherals.SIO);
+
     let mut mc = Multicore::new(&mut peripherals.PSM, &mut peripherals.PPB, &mut sio.fifo);
     let cores = mc.cores();
     let core1 = &mut cores[1];
+    if handoff_to_core_1 {
+        let _test = core1.spawn(unsafe { &mut CORE1_STACK.mem }, move || core1_task());
+    }
 
     let sys_freq = clocks.system_clock.freq().to_Hz();
     let mut delay = Delay::new(core.SYST, sys_freq);
@@ -269,14 +350,111 @@ fn main() -> ! {
     let mut enable_pin = pins.gpio2.into_push_pull_output();
     let mut debug_awake_pin: Pin<Gpio27, Output<PushPull>> = pins.gpio27.into_push_pull_output();
     let mut debug_frame_read_pin = pins.gpio26.into_push_pull_output();
+
+    let mut packet_pin = pins.gpio22.into_push_pull_output();
+
+    //let mut side_pin = pins.gpio6.into_mode::<rp2040_hal::gpio::FunctionPio0>();
+
     enable_pin.set_high().unwrap();
 
+    /*
+    {
+        let dma = peripherals.DMA.split(&mut peripherals.RESETS);
+        let (mut pio0, sm0, _, _, _) = peripherals.PIO0.split(&mut peripherals.RESETS);
+        let program_with_defines = pio_proc::pio_file!("./src/soft_spi_slave.pio");
+        let installed = pio0.install(&program_with_defines.program).unwrap();
+        let val = 1u32 << 24 | 2u32 << 16 | 3u32 << 8 | 255u32;
+        let use_pio = false;
+
+        if use_pio {
+            let _spi_clk = pins.gpio18.into_mode::<rp2040_hal::gpio::FunctionPio0>();
+            let _spi_miso = pins.gpio19.into_mode::<rp2040_hal::gpio::FunctionPio0>();
+            //let _spi_miso = pins.gpio19.into_mode::<rp2040_hal::gpio::FunctionPio0>();
+            let _spi_cs = pins.gpio17.into_mode::<rp2040_hal::gpio::FunctionPio0>();
+            let sclk_id = 18;
+            let miso_id = 19;
+
+            // Build the pio program and set pin both for set and side set!
+            // We are running with the default divider which is 1 (max speed)
+            let (mut sm, _, mut tx) = PIOBuilder::from_program(installed)
+                //.side_set_pin_base(miso_id)
+                .out_pins(miso_id, 1)
+                .out_shift_direction(ShiftDirection::Left)
+                .pull_threshold(32)
+                .autopush(true)
+                .autopull(true)
+                .build(sm0);
+
+            // TODO: See if I can get any faster with SPI?
+            sm.set_pindirs([(miso_id, rp2040_hal::pio::PinDir::Output)]);
+
+            let mut sm = sm.start();
+            unsafe {
+                for i in 0..tx_buf.len() {
+                    tx_buf[i] = val;
+                }
+                info!("{:#034b}", tx_buf[1]);
+                info!("Begin transfer");
+                let mut dma_ch0 = dma.ch0;
+                loop {
+                    let tx_transfer = single_buffer::Config::new(dma_ch0, &tx_buf, tx).start();
+                    let (ch0, tx_buf_2, tx_ret) = tx_transfer.wait();
+                    tx_buf = *tx_buf_2;
+                    tx = tx_ret;
+                    dma_ch0 = ch0;
+                }
+                info!("End transfer");
+            }
+        } else {
+            let _spi_mosi = pins.gpio16.into_mode::<FunctionSpi>();
+            let _spi_miso = pins.gpio19.into_mode::<FunctionSpi>();
+            let _spi_sck = pins.gpio18.into_mode::<FunctionSpi>();
+            let _spi_cs = pins.gpio17.into_mode::<FunctionSpi>();
+
+            let spi: Spi<_, SPI0, 8> = Spi::new(peripherals.SPI0);
+            let mut spi = spi.init(
+                &mut peripherals.RESETS,
+                133_000_000.Hz(),
+                12_000_000.Hz(),
+                &embedded_hal::spi::MODE_3,
+                true,
+            );
+            unsafe {
+                for i in 0..tx_buf.len() {
+                    tx_buf[i] = val;
+                }
+                let mut buf_u8 = unsafe { any_as_u8_slice(&tx_buf) };
+                info!("{:#034b}", tx_buf[1]);
+                info!("Begin transfer");
+
+                let mut dma_ch0 = dma.ch0;
+                loop {
+                    let tx_transfer = single_buffer::Config::new(dma_ch0, &*buf_u8, spi).start();
+                    let (ch0, tx_buf_2, tx_ret) = tx_transfer.wait();
+                    buf_u8 = tx_buf_2;
+                    spi = tx_ret;
+                    dma_ch0 = ch0;
+                }
+
+                //let tx_transfer = single_buffer::Config::new(dma.ch0, &*buf_u8, spi).start();
+                //let (ch0, tx_buf_2, spi) = tx_transfer.wait();
+                info!("End transfer");
+            }
+            }
+
+        loop {
+            //tx.write(val);
+            wfi();
+        }
+    }*/
+
     info!("Freq {:?}", clocks.peripheral_clock.freq().to_Hz());
-    let (spi, speed) = Spi::new(peripherals.SPI1).init(
+    let spi = Spi::new(peripherals.SPI1).init(
         &mut peripherals.RESETS,
         clocks.peripheral_clock.freq(), // 125_000_000
         spi_clock_freq,
         &embedded_hal::spi::MODE_3,
+        false,
     );
     let mut lepton = Lepton::new(
         rp_pico::hal::I2C::i2c0(
@@ -294,7 +472,6 @@ fn main() -> ! {
         pins.gpio10.into_mode(),
         pins.gpio3.into_mode(),
     );
-    info!("Baud-rate {:?}", speed.to_MHz());
     let timer = Timer::new(peripherals.TIMER, &mut peripherals.RESETS);
     // Reboot every time we start up the program to get to a known state.
     lepton.reboot(&mut delay, true);
@@ -321,7 +498,10 @@ fn main() -> ! {
     let mut n_frames = 0;
 
     let mut prev_packet_id = -1;
+    let crc_check = Crc::<u16>::new(&CRC_16_XMODEM);
 
+    let do_crc_check = false;
+    let mut crc_buffer = [0u8; 164];
     'frame_loop: loop {
         debug_awake_pin.set_low().unwrap();
         // NOTE: Go into dormant state
@@ -332,8 +512,16 @@ fn main() -> ! {
         let disabled_rosc = RingOscillator::new(dormant_rosc.free());
         let initialized_rosc = disabled_rosc.initialize();
         rosc = initialized_rosc;
+        // info!("Woke up");
         debug_awake_pin.set_high().unwrap();
         lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
+
+        // NOTE: - it's possible to greedily clock out all 4 segments in the first vsync pulse, but
+        //  the lepton module seems to not be able to feed all 4 segments out cleanly, so it outputs
+        //  a couple of dozen discard packets before each frame segment.  This uses slightly more
+        //  power to read out sequentially than just waiting for the vsync pulse for each segment,
+        //  processing it with no discards, and then going dormant again.
+        rosc.set_operating_frequency(rosc_clock_freq);
 
         let mut discards_before_first_good = 0;
         let mut segment_num = 0;
@@ -365,18 +553,29 @@ fn main() -> ! {
             // Indicate that we're starting to read out a new frame
             debug_frame_read_pin.set_high().unwrap();
         }
-        // NOTE: - it's possible to greedily clock out all 4 segments in the first vsync pulse, but
-        //  the lepton module seems to not be able to feed all 4 segments out cleanly, so it outputs
-        //  a couple of dozen discard packets before each frame segment.  This uses slightly more
-        //  power to read out sequentially than just waiting for the vsync pulse for each segment,
-        //  processing it with no discards, and then going dormant again.
-        rosc.set_operating_frequency(rosc_clock_freq);
-        lepton.cs_low();
-        lepton.start_clock(clocks.peripheral_clock.freq(), spi_clock_freq);
+        //lepton.cs_low();
+        //lepton.start_clock(clocks.peripheral_clock.freq(), spi_clock_freq);
+
+        //{
+        //    let cs = unsafe { CriticalSection::new() };
+        if handoff_to_core_1 {
+            if !sio.fifo.is_write_ready() {
+                info!("fifo full");
+            }
+            sio.fifo.write(1);
+        }
+        //critical_section::with(|_cs| {
+        // Tell core1 we're awake, and that it can start processing the previous segment.
+
         'scanline: loop {
             // Read out 1 scanline of the video frame
-            let packet = lepton.transfer_block(&mut buffer).unwrap();
-            let packet_header = packet[0];
+
+            // TODO: If we want to do CRC checks, ideally we'd interleave that work with the transfer.
+            // Also, it would be good to have this be a DMA driven thing.
+            packet_pin.set_high().unwrap();
+            lepton.transfer(&mut buffer).unwrap();
+            packet_pin.set_low().unwrap();
+            let packet_header = buffer[0];
             let is_discard_packet = packet_header & 0x0f00 == 0x0f00;
             if is_discard_packet {
                 discards_before_first_good += 1;
@@ -386,6 +585,17 @@ fn main() -> ! {
             if packet_id != prev_packet_id + 1 && segment_num != 0 {
                 warn!("Expected {}, got {}", prev_packet_id + 1, packet_id);
             }
+
+            if do_crc_check {
+                // Check crc
+                let crc = buffer[1].to_le();
+                BigEndian::write_u16_into(&buffer, &mut crc_buffer);
+                crc_buffer[0] = crc_buffer[0] & 0x0f;
+                crc_buffer[2] = 0;
+                crc_buffer[3] = 0;
+                crate::assert_eq!(crc_check.checksum(&crc_buffer), crc);
+            }
+
             prev_packet_id = packet_id;
             if packet_id == 20 {
                 // NOTE: Packet 20 is the only packet that has a valid segment id in its header.
@@ -393,15 +603,39 @@ fn main() -> ! {
                 if segment_num == 1 {
                     got_sync = true;
                 }
+                if segment_num == 0 {
+                    // TODO - entire segment should be discarded.
+                }
             }
+
+            // Copy the line out to the appropriate place in the current segment buffer.
+            if handoff_to_core_1 {
+                critical_section::with(|cs| {
+                    let mut frame_seg = FRAME_BUFFER.front.borrow_ref_mut(cs);
+                    (frame_seg.0).0 = segment_num as u8;
+                    if (packet_id as usize) < (frame_seg.0).1.len() {
+                        LittleEndian::write_u16_into(
+                            &buffer[2..],
+                            &mut (frame_seg.0).1[packet_id as usize][..],
+                        );
+                        //(frame_seg.0).1[packet_id as usize].copy_from_slice(&buffer[2..]);
+                    } else {
+                        warn!("Invalid packet id {}", packet_id);
+                    }
+                });
+            }
+
             if packet_id == 60 {
                 prev_packet_id = -1;
                 last_segment_was_4 = segment_num == 4;
             }
-            if packet_id == 60  { // NOTE: To clock out all segments at once: && (segment_num == 4 || !started)
+            if packet_id == 60 {
+                // NOTE: To clock out all segments at once: && (segment_num == 4 || !started)
                 if segment_num == 4 {
                     // We've finished reading out the frame.
                     debug_frame_read_pin.set_low().unwrap();
+                    // We want to hand-off to core1, which can send out our debug frame over spi to the
+                    // raspberry pi.
 
                     // TODO: Work out how to successfully come out of power-off mode for the lepton
                     //  - This may require a board with access to the reset and pwr pins, rather
@@ -410,9 +644,20 @@ fn main() -> ! {
                 break 'scanline;
             }
         }
+        //}
+
+        lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
+        // Wait for core1 to finish processing.
+        //});
+        //info!("Waiting on core1");
+        if handoff_to_core_1 {
+            let core_1_completed = sio.fifo.read_blocking();
+            // Swap buffer
+            FRAME_BUFFER.swap();
+        }
         // Setting the lepton baud-rate to 0 while dormant seems to help with power usage a tiny bit.
-        lepton.stop_clock();
-        lepton.cs_high();
+        //lepton.stop_clock();
+        //lepton.cs_high();
         lepton.spi.vsync.clear_interrupt(Interrupt::EdgeHigh);
     }
 }

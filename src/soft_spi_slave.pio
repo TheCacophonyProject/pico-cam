@@ -1,0 +1,13 @@
+.program soft_spi_slave
+; wait for enable
+wait 1 gpio 17
+wait 0 gpio 17
+.wrap_target
+    set x, 31
+bitloop:
+    ; wait for clock high then low
+    wait 1 gpio 18
+    wait 0 gpio 18
+    out pins, 1
+    jmp x-- bitloop
+.wrap

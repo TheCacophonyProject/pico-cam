@@ -1,3 +1,6 @@
+use crate::XOSC_CRYSTAL_FREQ;
+use rp_pico::pac;
+
 pub fn rosc_frequency_count_hz() -> u32 {
     // Use the reference xosc while enabled to measure the speed of the rosc, apparently.
     let peripherals = unsafe { pac::Peripherals::steal() };
